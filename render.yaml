@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: convert-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
