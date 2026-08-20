@@ -11,7 +11,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = path.join(__dirname, 'temp');
 
-// 确保临时目录存在
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR);
 }
@@ -19,19 +18,12 @@ if (!fs.existsSync(TEMP_DIR)) {
 app.use(cors());
 app.use('/files', express.static(TEMP_DIR));
 
-// 文件上传配置
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-/**
- * 转换接口
- * POST /api/convert
- * formData: file, sourceFormat, targetFormat, fileName
- * 返回: { code: 0, data: { resultUrl, resultFileName } }
- */
 app.post('/api/convert', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -51,17 +43,30 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     console.log(`[Convert] ${fileName} (${sourceFormat} → ${targetFormat})`);
 
-    // 调用 LibreOffice 转换
-    const resultBuffer = await convert(req.file.buffer, ext, undefined);
+    let resultBuffer;
+    try {
+      resultBuffer = await convert(req.file.buffer, ext, undefined);
+    } catch (convertErr) {
+      console.error('[Convert] libreoffice error:', convertErr);
+      return res.status(500).json({
+        code: -1,
+        message: '文件转换失败：' + (convertErr.message || 'LibreOffice 错误'),
+      });
+    }
 
-    // 保存转换后的文件
+    if (!resultBuffer || resultBuffer.length === 0) {
+      return res.status(500).json({
+        code: -1,
+        message: '转换结果为空，可能不支持该格式转换',
+      });
+    }
+
     fs.writeFileSync(outputPath, resultBuffer);
 
-    // 构造下载 URL
     const baseUrl = req.protocol + '://' + req.get('host');
     const resultUrl = baseUrl + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
 
-    console.log(`[Convert] success: ${resultFileName}`);
+    console.log(`[Convert] success: ${resultFileName} (${resultBuffer.length} bytes)`);
 
     res.json({
       code: 0,
@@ -74,7 +79,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
   }
 });
 
-// 定时清理过期文件（1小时前的文件）
+// 定时清理过期文件
 setInterval(() => {
   try {
     const files = fs.readdirSync(TEMP_DIR);
@@ -88,9 +93,9 @@ setInterval(() => {
       }
     });
   } catch (e) {
-    // 忽略清理错误
+    // 忽略
   }
-}, 1800000); // 每30分钟清理一次
+}, 1800000);
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'convert-server' });
