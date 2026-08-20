@@ -31,8 +31,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
 
-/** CloudConvert API 请求封装 */
-function ccRequest(method, path, { body, formData, isBinary } = {}) {
+/** CloudConvert API 请求 */
+function ccRequest(method, apiPath, { body, isBinary } = {}) {
   return new Promise((resolve, reject) => {
     const headers = {
       'Authorization': 'Bearer ' + CLOUDCONVERT_API_KEY,
@@ -40,32 +40,7 @@ function ccRequest(method, path, { body, formData, isBinary } = {}) {
     };
 
     let bodyData = null;
-
-    if (formData) {
-      const boundary = '----cc' + Date.now();
-      headers['Content-Type'] = `multipart/form-data; boundary=${boundary}`;
-      const parts = [];
-      for (const [key, value] of Object.entries(formData)) {
-        if (value.file) {
-          const fileData = fs.readFileSync(value.file);
-          parts.push(Buffer.from(
-            `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="${key}"; filename="${encodeURIComponent(value.filename)}"\r\n` +
-            `Content-Type: application/octet-stream\r\n\r\n`
-          ));
-          parts.push(fileData);
-          parts.push(Buffer.from('\r\n'));
-        } else {
-          parts.push(Buffer.from(
-            `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`
-          ));
-        }
-      }
-      parts.push(Buffer.from(`--${boundary}--\r\n`));
-      bodyData = Buffer.concat(parts);
-      headers['Content-Length'] = bodyData.length;
-    } else if (body) {
+    if (body) {
       bodyData = JSON.stringify(body);
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = Buffer.byteLength(bodyData);
@@ -73,7 +48,7 @@ function ccRequest(method, path, { body, formData, isBinary } = {}) {
 
     const options = {
       hostname: 'api.cloudconvert.com',
-      path: '/v2' + path,
+      path: '/v2' + apiPath,
       method,
       headers,
       timeout: 180000,
@@ -88,16 +63,14 @@ function ccRequest(method, path, { body, formData, isBinary } = {}) {
         try {
           const json = JSON.parse(text);
           if (res.statusCode >= 400) {
+            console.error('[CC] error response:', text.slice(0, 500));
             reject(new Error(json.message || json.error || `HTTP ${res.statusCode}`));
           } else {
             resolve(isBinary ? data : json);
           }
         } catch (e) {
-          if (isBinary) {
-            resolve(data);
-          } else {
-            reject(new Error('解析响应失败: ' + text.slice(0, 300)));
-          }
+          if (isBinary) resolve(data);
+          else reject(new Error('解析响应失败: ' + text.slice(0, 300)));
         }
       });
     });
@@ -105,33 +78,6 @@ function ccRequest(method, path, { body, formData, isBinary } = {}) {
     req.on('timeout', () => { req.destroy(); reject(new Error('请求超时')); });
     if (bodyData) req.write(bodyData);
     req.end();
-  });
-}
-
-/** 等待 CloudConvert 任务完成 */
-function waitForTask(taskId) {
-  return new Promise((resolve, reject) => {
-    let attempts = 0;
-    const maxAttempts = 60;
-
-    function poll() {
-      attempts++;
-      if (attempts > maxAttempts) return reject(new Error('转换超时'));
-
-      ccRequest('GET', '/tasks/' + taskId).then((result) => {
-        const task = result.data;
-        if (task.status === 'finished') {
-          const url = task.result?.files?.[0]?.url || task.result?.url;
-          if (url) resolve(url);
-          else reject(new Error('转换完成但无下载地址'));
-        } else if (task.status === 'error') {
-          reject(new Error(task.message || '转换失败'));
-        } else {
-          setTimeout(poll, 3000);
-        }
-      }).catch(reject);
-    }
-    poll();
   });
 }
 
@@ -155,24 +101,47 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     console.log(`[Convert] ${fileName} (${sourceFormat} → ${targetFormat})`);
 
-    // Step 1: 创建 upload 任务
-    const uploadTask = await ccRequest('POST', '/upload', {
-      body: { filename: fileName },
+    // Step 1: 创建 Job（import/upload → convert → export/url）
+    const job = await ccRequest('POST', '/jobs', {
+      body: {
+        tasks: [
+          { name: 'import', operation: 'import/upload' },
+          {
+            name: 'convert',
+            operation: 'convert',
+            input: 'import',
+            output_format: targetFormat,
+          },
+          { name: 'export', operation: 'export/url', input: 'convert' },
+        ],
+      },
     });
-    const uploadUrl = uploadTask.data.result.url;
-    const uploadForm = uploadTask.data.result.form || {};
 
-    // Step 2: 上传文件到 CloudConvert
+    const jobId = job.data.id;
+    console.log(`[Convert] job created: ${jobId}`);
+
+    // Step 2: 获取上传地址
+    const importTask = job.data.tasks.find((t) => t.name === 'import');
+    if (!importTask || !importTask.result || !importTask.result.url) {
+      throw new Error('无法获取上传地址');
+    }
+    const uploadUrl = importTask.result.url;
+    const uploadForm = importTask.result.form || {};
+    console.log('[Convert] upload URL obtained');
+
+    // Step 3: 上传文件到 CloudConvert S3
     await new Promise((resolve, reject) => {
       const fileData = fs.readFileSync(inputPath);
-      const boundary = '----upload' + Date.now();
+      const boundary = '----ccupload' + Date.now();
       const parts = [];
 
+      // 添加 form 字段
       for (const [key, value] of Object.entries(uploadForm)) {
         parts.push(Buffer.from(
           `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`
         ));
       }
+      // 添加文件
       parts.push(Buffer.from(
         `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${encodeURIComponent(fileName)}"\r\nContent-Type: application/octet-stream\r\n\r\n`
       ));
@@ -192,7 +161,18 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
         timeout: 120000,
       }, (uploadRes) => {
         uploadRes.on('data', () => {});
-        uploadRes.on('end', () => resolve());
+        uploadRes.on('end', () => {
+          console.log('[Convert] upload status:', uploadRes.statusCode);
+          if (uploadRes.statusCode >= 200 && uploadRes.statusCode < 300) {
+            resolve();
+          } else {
+            let errBody = '';
+            uploadRes.on('data', (c) => errBody += c);
+            uploadRes.on('end', () => {
+              reject(new Error('上传失败: HTTP ' + uploadRes.statusCode + ' ' + errBody.slice(0, 200)));
+            });
+          }
+        });
       });
       uploadReq.on('error', reject);
       uploadReq.on('timeout', () => { uploadReq.destroy(); reject(new Error('上传超时')); });
@@ -201,23 +181,53 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     });
     console.log('[Convert] file uploaded');
 
-    // Step 3: 创建转换任务
-    const convertTask = await ccRequest('POST', '/convert', {
-      body: {
-        name: resultFileName,
-        input: uploadTask.data.id,
-        output_format: targetFormat,
-      },
+    // Step 4: 轮询 Job 状态
+    let downloadUrl = null;
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const jobStatus = await ccRequest('GET', '/jobs/' + jobId);
+      const tasks = jobStatus.data.tasks || [];
+
+      // 检查是否有错误
+      const errorTask = tasks.find((t) => t.status === 'error');
+      if (errorTask) {
+        throw new Error(errorTask.message || '转换任务失败');
+      }
+
+      // 检查是否全部完成
+      const exportTask = tasks.find((t) => t.name === 'export');
+      if (exportTask && exportTask.status === 'finished') {
+        downloadUrl = exportTask.result?.files?.[0]?.url;
+        if (downloadUrl) break;
+      }
+
+      // 检查 job 状态
+      if (jobStatus.data.status === 'finished') {
+        downloadUrl = exportTask?.result?.files?.[0]?.url;
+        if (downloadUrl) break;
+        throw new Error('任务完成但无下载地址');
+      }
+    }
+
+    if (!downloadUrl) {
+      throw new Error('转换超时，请重试');
+    }
+    console.log('[Convert] job finished, downloading...');
+
+    // Step 5: 下载转换后的文件
+    const fileBuffer = await new Promise((resolve, reject) => {
+      const parsedUrl = new URL(downloadUrl);
+      https.get({
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        timeout: 120000,
+      }, (dlRes) => {
+        const chunks = [];
+        dlRes.on('data', (c) => chunks.push(c));
+        dlRes.on('end', () => resolve(Buffer.concat(chunks)));
+      }).on('error', reject);
     });
-    const convertTaskId = convertTask.data.id;
-    console.log(`[Convert] convert task: ${convertTaskId}`);
 
-    // Step 4: 等待转换完成
-    const downloadUrl = await waitForTask(convertTaskId);
-    console.log('[Convert] convert done, downloading...');
-
-    // Step 5: 下载文件
-    const fileBuffer = await ccRequest('GET', downloadUrl.replace('https://api.cloudconvert.com', ''), { isBinary: true });
     fs.writeFileSync(finalPath, fileBuffer);
     fs.unlinkSync(inputPath);
 
