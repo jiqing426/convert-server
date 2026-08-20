@@ -256,17 +256,17 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       }
     }
 
-    // 降级 ConvertAPI
-    if (!fileBuffer && CONVERTAPI_SECRET) {
-      try {
-        console.log('[Convert] trying ConvertAPI...');
-        fileBuffer = await convertViaConvertAPI(inputPath, sourceFormat, targetFormat);
-        usedService = 'ConvertAPI';
-      } catch (caErr) {
-        console.log('[Convert] ConvertAPI failed:', caErr.message);
-        if (!fileBuffer) throw caErr;
-      }
-    }
+    // 降级 ConvertAPI（暂时禁用，测试 CloudConvert）
+    // if (!fileBuffer && CONVERTAPI_SECRET) {
+    //   try {
+    //     console.log('[Convert] trying ConvertAPI...');
+    //     fileBuffer = await convertViaConvertAPI(inputPath, sourceFormat, targetFormat);
+    //     usedService = 'ConvertAPI';
+    //   } catch (caErr) {
+    //     console.log('[Convert] ConvertAPI failed:', caErr.message);
+    //     if (!fileBuffer) throw caErr;
+    //   }
+    // }
 
     if (!fileBuffer) {
       throw new Error('所有转换服务均不可用，请稍后重试');
