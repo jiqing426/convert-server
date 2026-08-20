@@ -11,12 +11,22 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = path.join(__dirname, 'temp');
 
+// 信任反向代理，正确获取 https 协议
+app.set('trust proxy', true);
+
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR);
 }
 
 app.use(cors());
 app.use('/files', express.static(TEMP_DIR));
+
+// 获取基础 URL，确保使用 https（Render 等平台在反向代理后 req.protocol 可能是 http）
+function getBaseUrl(req) {
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return proto + '://' + host;
+}
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, TEMP_DIR),
@@ -32,7 +42,6 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-// 格式 → soffice filter 映射
 const SOFFICE_FILTER = {
   pdf: 'pdf:writer_pdf_Export',
   docx: 'docx:MS Word 2007 XML',
@@ -60,7 +69,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     console.log(`[Convert] ${fileName} (${sourceFormat} → ${targetFormat})`);
 
-    // PDF → TXT：使用 pdftotext（poppler-utils）
+    // PDF → TXT：使用 pdftotext
     if (sourceFormat === 'pdf' && targetFormat === 'txt') {
       try {
         await execFileAsync('pdftotext', [inputPath, finalPath], {
@@ -69,8 +78,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
         });
         if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 0) {
           fs.unlinkSync(inputPath);
-          const baseUrl = req.protocol + '://' + req.get('host');
-          const resultUrl = baseUrl + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
+          const resultUrl = getBaseUrl(req) + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
           console.log(`[Convert] success (pdftotext): ${resultFileName}`);
           return res.json({
             code: 0,
@@ -95,10 +103,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     const filter = SOFFICE_FILTER[targetFormat] || targetFormat;
     const args = [
-      '--headless',
-      '--nologo',
-      '--nofirststartwizard',
-      '--norestore',
+      '--headless', '--nologo', '--nofirststartwizard', '--norestore',
       '--convert-to', filter,
       '--outdir', outputDir,
       inputPath,
@@ -127,7 +132,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
       outputFile = expectedOutput;
     } else {
-      // 尝试输出目录中的任意文件
       const files = fs.readdirSync(outputDir).filter(f => !f.startsWith('.'));
       if (files.length > 0) {
         outputFile = path.join(outputDir, files[0]);
@@ -135,7 +139,6 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     }
 
     if (!outputFile) {
-      // 清理
       try { fs.rmSync(outputDir, { recursive: true }); } catch(e) {}
       fs.unlinkSync(inputPath);
       return res.status(500).json({
@@ -149,8 +152,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
     try { fs.rmSync(outputDir, { recursive: true }); } catch(e) {}
     fs.unlinkSync(inputPath);
 
-    const baseUrl = req.protocol + '://' + req.get('host');
-    const resultUrl = baseUrl + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
+    const resultUrl = getBaseUrl(req) + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
     const fileSize = fs.statSync(finalPath).size;
     console.log(`[Convert] success: ${resultFileName} (${fileSize} bytes)`);
 
