@@ -3,15 +3,15 @@ const multer = require('multer');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
+const https = require('https');
 
-const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = path.join(__dirname, 'temp');
 
-// 信任反向代理，正确获取 https 协议
+// ConvertAPI 密钥（在 Render 环境变量中设置）
+const CONVERTAPI_SECRET = process.env.CONVERTAPI_SECRET;
+
 app.set('trust proxy', true);
 
 if (!fs.existsSync(TEMP_DIR)) {
@@ -21,7 +21,6 @@ if (!fs.existsSync(TEMP_DIR)) {
 app.use(cors());
 app.use('/files', express.static(TEMP_DIR));
 
-// 获取基础 URL，确保使用 https（Render 等平台在反向代理后 req.protocol 可能是 http）
 function getBaseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers['x-forwarded-host'] || req.get('host');
@@ -42,18 +41,90 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-const SOFFICE_FILTER = {
-  pdf: 'pdf:writer_pdf_Export',
-  docx: 'docx:MS Word 2007 XML',
-  doc: 'doc:MS Word 97',
-  txt: 'txt:Text',
-  rtf: 'rtf:Rich Text Format',
-};
+/** 调用 ConvertAPI 执行转换 */
+function convertViaConvertAPI(inputPath, sourceFormat, targetFormat) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----' + Date.now();
+    const fileName = path.basename(inputPath);
+    const fileData = fs.readFileSync(inputPath);
+
+    // 构建 multipart/form-data 请求体
+    const header = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([header, fileData, footer]);
+
+    const options = {
+      hostname: 'v2.convertapi.com',
+      path: `/convert/${sourceFormat}/to/${targetFormat}?Secret=${CONVERTAPI_SECRET}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+      timeout: 120000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          if (result.Files && result.Files.length > 0) {
+            const file = result.Files[0];
+            if (file.FileData) {
+              // 返回 base64 编码的文件数据
+              resolve({
+                buffer: Buffer.from(file.FileData, 'base64'),
+                fileName: file.FileName,
+              });
+            } else if (file.Url) {
+              // 从 URL 下载文件
+              https.get(file.Url, (dlRes) => {
+                const chunks = [];
+                dlRes.on('data', (c) => chunks.push(c));
+                dlRes.on('end', () => {
+                  resolve({
+                    buffer: Buffer.concat(chunks),
+                    fileName: file.FileName,
+                  });
+                });
+              }).on('error', reject);
+            } else {
+              reject(new Error('ConvertAPI 返回格式异常'));
+            }
+          } else {
+            const msg = result.Message || result.Error || '转换失败';
+            reject(new Error(msg));
+          }
+        } catch (e) {
+          reject(new Error('解析 ConvertAPI 响应失败: ' + data.slice(0, 200)));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('ConvertAPI 请求超时')); });
+    req.write(body);
+    req.end();
+  });
+}
 
 app.post('/api/convert', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ code: -1, message: '未收到文件' });
+    }
+
+    if (!CONVERTAPI_SECRET) {
+      return res.status(500).json({
+        code: -1,
+        message: '服务器未配置 ConvertAPI 密钥，请在 Render 环境变量中设置 CONVERTAPI_SECRET',
+      });
     }
 
     const { sourceFormat, targetFormat, fileName } = req.body;
@@ -69,87 +140,11 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     console.log(`[Convert] ${fileName} (${sourceFormat} → ${targetFormat})`);
 
-    // PDF → TXT：使用 pdftotext
-    if (sourceFormat === 'pdf' && targetFormat === 'txt') {
-      try {
-        await execFileAsync('pdftotext', [inputPath, finalPath], {
-          timeout: 60000,
-          env: { ...process.env, HOME: '/tmp' },
-        });
-        if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 0) {
-          fs.unlinkSync(inputPath);
-          const resultUrl = getBaseUrl(req) + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
-          console.log(`[Convert] success (pdftotext): ${resultFileName}`);
-          return res.json({
-            code: 0,
-            message: 'success',
-            data: { resultUrl, resultFileName },
-          });
-        }
-      } catch (err) {
-        console.error('[Convert] pdftotext error:', err.message);
-        return res.status(500).json({
-          code: -1,
-          message: 'PDF 文本提取失败：' + (err.message || ''),
-        });
-      }
-    }
+    // 调用 ConvertAPI
+    const result = await convertViaConvertAPI(inputPath, sourceFormat, targetFormat);
 
-    // 其他格式：使用 soffice
-    const outputDir = path.join(TEMP_DIR, 'out_' + taskId);
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir);
-    }
-
-    const filter = SOFFICE_FILTER[targetFormat] || targetFormat;
-    const args = [
-      '--headless', '--nologo', '--nofirststartwizard', '--norestore',
-      '--convert-to', filter,
-      '--outdir', outputDir,
-      inputPath,
-    ];
-
-    try {
-      const { stdout, stderr } = await execFileAsync('soffice', args, {
-        timeout: 120000,
-        env: { ...process.env, HOME: '/tmp' },
-      });
-      if (stdout) console.log('[Convert] soffice stdout:', stdout);
-      if (stderr) console.log('[Convert] soffice stderr:', stderr);
-    } catch (execErr) {
-      console.error('[Convert] soffice error:', execErr.message);
-      return res.status(500).json({
-        code: -1,
-        message: `转换失败：不支持 ${sourceFormat} → ${targetFormat}`,
-      });
-    }
-
-    // 查找输出文件
-    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
-    const expectedOutput = path.join(outputDir, inputBaseName + '.' + targetFormat);
-
-    let outputFile = null;
-    if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
-      outputFile = expectedOutput;
-    } else {
-      const files = fs.readdirSync(outputDir).filter(f => !f.startsWith('.'));
-      if (files.length > 0) {
-        outputFile = path.join(outputDir, files[0]);
-      }
-    }
-
-    if (!outputFile) {
-      try { fs.rmSync(outputDir, { recursive: true }); } catch(e) {}
-      fs.unlinkSync(inputPath);
-      return res.status(500).json({
-        code: -1,
-        message: `转换失败：不支持 ${sourceFormat} → ${targetFormat}`,
-      });
-    }
-
-    // 复制到最终路径
-    fs.copyFileSync(outputFile, finalPath);
-    try { fs.rmSync(outputDir, { recursive: true }); } catch(e) {}
+    // 保存转换后的文件
+    fs.writeFileSync(finalPath, result.buffer);
     fs.unlinkSync(inputPath);
 
     const resultUrl = getBaseUrl(req) + '/files/' + taskId + '_' + encodeURIComponent(resultFileName);
@@ -162,8 +157,11 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
       data: { resultUrl, resultFileName },
     });
   } catch (err) {
-    console.error('[Convert] error:', err);
-    res.status(500).json({ code: -1, message: err.message || '转换失败' });
+    console.error('[Convert] error:', err.message);
+    if (req.file) {
+      try { fs.unlinkSync(req.file.path); } catch(e) {}
+    }
+    res.status(500).json({ code: -1, message: '转换失败：' + (err.message || '') });
   }
 });
 
@@ -189,4 +187,7 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Convert server running on port ${PORT}`);
+  if (!CONVERTAPI_SECRET) {
+    console.warn('WARNING: CONVERTAPI_SECRET not set! Set it in Render environment variables.');
+  }
 });
