@@ -238,6 +238,7 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
 
     let fileBuffer = null;
     let usedService = null;
+    let lastError = null;
 
     // 优先 CloudConvert（10次/天免费）
     if (CLOUDCONVERT_API_KEY) {
@@ -246,30 +247,29 @@ app.post('/api/convert', upload.single('file'), async (req, res) => {
         fileBuffer = await convertViaCloudConvert(inputPath, sourceFormat, targetFormat, fileName);
         usedService = 'CloudConvert';
       } catch (ccErr) {
-        console.log('[Convert] CloudConvert failed:', ccErr.message);
-        // 如果是额度不足(402)，降级到 ConvertAPI
-        if (ccErr.statusCode === 402 || ccErr.message.includes('credit') || ccErr.message.includes('limit')) {
-          console.log('[Convert] CloudConvert credits exhausted, falling back to ConvertAPI');
-        } else if (!CONVERTAPI_SECRET) {
-          throw ccErr; // 没有 ConvertAPI 则直接报错
+        console.log('[Convert] CloudConvert failed:', ccErr.message, 'statusCode:', ccErr.statusCode);
+        lastError = ccErr;
+        // 额度不足时尝试降级到 ConvertAPI
+        if (ccErr.statusCode !== 402 && !ccErr.message.includes('credit') && !ccErr.message.includes('limit') && !CONVERTAPI_SECRET) {
+          throw ccErr; // 没有 ConvertAPI 降级则直接报错
         }
       }
     }
 
-    // 降级 ConvertAPI（暂时禁用，测试 CloudConvert）
-    // if (!fileBuffer && CONVERTAPI_SECRET) {
-    //   try {
-    //     console.log('[Convert] trying ConvertAPI...');
-    //     fileBuffer = await convertViaConvertAPI(inputPath, sourceFormat, targetFormat);
-    //     usedService = 'ConvertAPI';
-    //   } catch (caErr) {
-    //     console.log('[Convert] ConvertAPI failed:', caErr.message);
-    //     if (!fileBuffer) throw caErr;
-    //   }
-    // }
+    // 降级 ConvertAPI
+    if (!fileBuffer && CONVERTAPI_SECRET) {
+      try {
+        console.log('[Convert] trying ConvertAPI...');
+        fileBuffer = await convertViaConvertAPI(inputPath, sourceFormat, targetFormat);
+        usedService = 'ConvertAPI';
+      } catch (caErr) {
+        console.log('[Convert] ConvertAPI failed:', caErr.message);
+        lastError = caErr;
+      }
+    }
 
     if (!fileBuffer) {
-      throw new Error('所有转换服务均不可用，请稍后重试');
+      throw new Error(lastError ? lastError.message : '所有转换服务均不可用，请稍后重试');
     }
 
     fs.writeFileSync(finalPath, fileBuffer);
@@ -306,6 +306,34 @@ app.get('/health', (req, res) => {
     cloudconvert: !!CLOUDCONVERT_API_KEY,
     convertapi: !!CONVERTAPI_SECRET,
   });
+});
+
+// 调试端点：测试 CloudConvert API 连通性
+app.get('/api/debug-cc', async (req, res) => {
+  if (!CLOUDCONVERT_API_KEY) return res.json({ error: 'CLOUDCONVERT_API_KEY not set' });
+  try {
+    // 测试创建一个简单 Job
+    const job = await ccRequest('POST', '/jobs', {
+      body: {
+        tasks: [
+          { name: 'import', operation: 'import/upload' },
+          { name: 'convert', operation: 'convert', input: 'import', output_format: 'pdf' },
+          { name: 'export', operation: 'export/url', input: 'convert' },
+        ],
+      },
+    });
+    res.json({
+      ok: true,
+      jobId: job.data.id,
+      message: 'CloudConvert API key 有效，Job 创建成功',
+    });
+  } catch (err) {
+    res.json({
+      ok: false,
+      error: err.message,
+      statusCode: err.statusCode,
+    });
+  }
 });
 
 app.listen(PORT, () => {
