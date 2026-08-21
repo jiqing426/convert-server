@@ -77,18 +77,21 @@ function ccRequest(method, apiPath, { body } = {}) {
 }
 
 async function convertViaCloudConvert(inputPath, sourceFormat, targetFormat, fileName) {
-  // Step 1: 创建 Job
+  // Step 1: 创建 Job（tasks 必须用对象格式，key 为任务名）
   const job = await ccRequest('POST', '/jobs', {
     body: {
-      tasks: [
-        { name: 'import', operation: 'import/upload' },
-        { name: 'convert', operation: 'convert', input: 'import', output_format: targetFormat },
-        { name: 'export', operation: 'export/url', input: 'convert' },
-      ],
+      tasks: {
+        'import': { operation: 'import/upload' },
+        'convert': { operation: 'convert', input: 'import', output_format: targetFormat },
+        'export': { operation: 'export/url', input: 'convert' },
+      },
     },
   });
   const jobId = job.data.id;
   const importTask = job.data.tasks.find((t) => t.name === 'import');
+  if (!importTask || !importTask.result || !importTask.result.url) {
+    throw new Error('CloudConvert: 无法获取上传地址');
+  }
   const uploadUrl = importTask.result.url;
   const uploadForm = importTask.result.form || {};
 
@@ -312,14 +315,14 @@ app.get('/health', (req, res) => {
 app.get('/api/debug-cc', async (req, res) => {
   if (!CLOUDCONVERT_API_KEY) return res.json({ error: 'CLOUDCONVERT_API_KEY not set' });
   try {
-    // 测试创建一个简单 Job
+    // 测试创建一个简单 Job（tasks 用对象格式）
     const job = await ccRequest('POST', '/jobs', {
       body: {
-        tasks: [
-          { name: 'import', operation: 'import/upload' },
-          { name: 'convert', operation: 'convert', input: 'import', output_format: 'pdf' },
-          { name: 'export', operation: 'export/url', input: 'convert' },
-        ],
+        tasks: {
+          'import': { operation: 'import/upload' },
+          'convert': { operation: 'convert', input: 'import', output_format: 'pdf' },
+          'export': { operation: 'export/url', input: 'convert' },
+        },
       },
     });
     res.json({
